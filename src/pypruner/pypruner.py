@@ -3,7 +3,7 @@ from functools import cached_property
 import pkgutil
 import os
 import subprocess
-
+import importlib
 
 
 class Pruner:
@@ -25,20 +25,33 @@ class Pruner:
         return __import__(self.package_name)
 
     @cached_property
+    def path(self):
+        return self.package.__path__[0]
+
+    @cached_property
     def list_modules(self):
         module_list = []
         for _, module_name, _ in pkgutil.iter_modules(self.package.__path__):
-            module_path = os.path.join(self.package.__path__[0], module_name + ".py")
-            relative_module_path = os.path.relpath(module_path, self.package.__path__[0])
+            module_path = os.path.join(self.path, module_name + ".py")
+            relative_module_path = os.path.relpath(module_path, self.path)
             module_dict = {
                 'module_name': module_name,
                 'module_path': module_path,
                 'relative_module_path': relative_module_path,
                 'tree': ast.parse(open(module_path, "r").read()),
-                'output_path': os.path.join(self.output_dir, relative_module_path)
+                'output_path': os.path.join(self.output_dir, relative_module_path),
+                'classes': []
             }
+            for node in module_dict['tree'].body:
+                if isinstance(node, ast.ClassDef):
+                    module_dict['classes'].append(node.name)
             module_list.append(module_dict)
         return module_list
+
+    @cached_property
+    def list_callables(self):
+        pass
+
 
     def get_module(self, module_name):
         # Get the path to the module
@@ -154,17 +167,20 @@ class Pruner:
         for module in self.list_modules:
             tree = ast.parse(module["tree"])
             for node in ast.walk(tree):
+                this_package = False
                 if isinstance(node, ast.Import):
                     for name in node.names:
                         if len(name.name.split("."))>1:
-                             import_from = name.name.split(".")[0]
-                             import_name = name.name.split(".")[1]
+                                import_from = name.name.split(".")[0]
+                                import_name = name.name.split(".")[1]
                         else:
                             import_name = name.name
                             import_from= None
                         imported_modules.append({
                             "import_name": import_name,
                             "import_from": import_from,
+                            "import_all": False,
+                            "origin": importlib.util.find_spec(name.name).origin,
                             "alias": name.asname,
                             "unparsed": ast.unparse(node),
                             })
@@ -172,18 +188,29 @@ class Pruner:
 
                     for name in node.names:
                         if node.module is not None:
-                             import_from = node.module
+                                if "from ." in ast.unparse(node):
+                                    import_name = node.module
+                                    import_from = self.package_name
+                                else:
+                                    import_from = node.module
                         elif "from ." in ast.unparse(node):
-                            import_from = "."
+                            import_from = self.package_name
+                            origin = self.path
                         else:
                             import_from = None
+                            is_relative = False
 
-
-                        import_name = name.name
+                        if name.name == "*":
+                            import_all = True
+                        else:
+                            import_all = False
+                            import_name = name.name
 
                         imported_modules.append({
                             "import_name": import_name,
                             "import_from": import_from,
+                            "import_all": import_all,
+                            "origin": importlib.util.find_spec(import_from).origin,
                             "alias": name.asname,
                             "unparsed": ast.unparse(node),
                             })
@@ -199,3 +226,34 @@ class Pruner:
 
 
         return imported_modules
+    
+    def find_interdependencies(self, class_name: str, method_name: str):
+        interdependent_modules = {}     
+        assignments = {}
+
+        for call in self.find_all_calls(class_name, method_name):
+            # Finding any called modules
+            called_modules = [module for module in self.list_modules if call["called"] in module["classes"]]
+            for module in called_modules:
+                # If the called module is in the package, add it to the list, or create a list if not exists
+                interdependent_modules.setdefault(module["module_name"], []).append(call["called"])
+                #TODO: Need to find times the target was called to see what method was used
+                if call["target"] is not None:
+                    assignments[module["module_name"]] = call["target"]
+        # Getting rid of duplicates
+        for module in interdependent_modules:
+            interdependent_modules[module] = list(set(interdependent_modules[module]))
+        
+        # Recursively finding interdependencies of interdependencies
+        if len(interdependent_modules) > 0:
+            print(interdependent_modules)
+            for module, classes in interdependent_modules.items():
+                for called_class in classes:
+                    recursive_dependencies = self.find_interdependencies(module, called_class)
+                    print(f"Module: {module}, Class: {called_class}")
+                    print(f"Recursive dependencies: {recursive_dependencies}")
+                    interdependent_modules[module].extend(
+                        recursive_dependencies)
+
+
+        return interdependent_modules
